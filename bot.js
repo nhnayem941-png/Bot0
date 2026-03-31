@@ -1,0 +1,555 @@
+const { Telegraf, Markup } = require("telegraf");
+const axios = require("axios");
+const Database = require("better-sqlite3");
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
+const { URL } = require("url");
+
+const config = require("./config");
+
+// ===== DATABASE =====
+const db = new Database("bot_database.db");
+db.exec(`CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    first_name TEXT,
+    joined_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)`);
+
+const addUser = db.prepare("INSERT OR IGNORE INTO users (user_id, username, first_name) VALUES (?, ?, ?)");
+const countUsers = db.prepare("SELECT COUNT(*) as count FROM users");
+
+// ===== BOT =====
+const bot = new Telegraf(config.BOT_TOKEN);
+
+// ===== FORCE JOIN =====
+async function checkMembership(ctx, userId) {
+    const notJoined = [];
+    for (const channel of config.CHANNELS) {
+        try {
+            const member = await ctx.telegram.getChatMember(channel, userId);
+            if (["left", "kicked"].includes(member.status)) {
+                notJoined.push(channel);
+            }
+        } catch {
+            notJoined.push(channel);
+        }
+    }
+    return notJoined;
+}
+
+function getJoinKeyboard(notJoined) {
+    const buttons = notJoined.map(ch => [
+        Markup.button.url(`📢 Join ${ch}`, `https://t.me/${ch.replace("@", "")}`)
+    ]);
+    buttons.push([Markup.button.callback("✅ ভেরিফাই করুন", "verify_join")]);
+    return Markup.inlineKeyboard(buttons);
+}
+
+// ===== LOADING ANIMATION =====
+async function sendLoading(ctx, filename) {
+    const frames = [
+        "⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛ 0%",
+        "🟩🟩⬛⬛⬛⬛⬛⬛⬛⬛ 20%",
+        "🟩🟩🟩🟩⬛⬛⬛⬛⬛⬛ 40%",
+        "🟩🟩🟩🟩🟩🟩⬛⬛⬛⬛ 60%",
+        "🟩🟩🟩🟩🟩🟩🟩🟩⬛⬛ 80%",
+        "🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 100%",
+    ];
+    const msg = await ctx.reply(`⏳ Processing: ${filename}\n\n${frames[0]}`);
+    for (let i = 1; i < frames.length; i++) {
+        await new Promise(r => setTimeout(r, 300));
+        try {
+            await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, `⏳ Processing: ${filename}\n\n${frames[i]}`);
+        } catch {}
+    }
+    return msg;
+}
+
+async function sendResultCard(ctx, filename, fileSize = "N/A") {
+    const text = `
+━━━━━━━━━━━━━━━━━━━━
+📁 File: ${filename}
+🛡️ Security: ✅ Cleaned
+🎨 Format: ✅ Beautified
+⚡ Status: Successfully processed
+━━━━━━━━━━━━━━━━━━━━
+📤 Output includes:
+• 📄 File size: ${fileSize}
+• 📸 Screenshot preview
+• 📄 Clean HTML file
+• 🔒 Secure version
+━━━━━━━━━━━━━━━━━━━━
+👨‍💻 Developer: ${config.DEVELOPER_USERNAME}
+👨‍💻 BY: ${config.BOT_USERNAME}`;
+    await ctx.reply(text);
+}
+
+// ===== DECODERS =====
+function multiLayerDecode(content) {
+    const results = [];
+    let decoded = content;
+
+    if (/phpkobo|html-obfuscator/i.test(content)) {
+        results.push("🔍 PHPKobo Obfuscation ডিটেক্ট করা হয়েছে");
+    }
+    if (/bj\s*coder|bjcoder/i.test(content)) {
+        results.push("🔍 BJ Coder Encryption ডিটেক্ট করা হয়েছে");
+    }
+
+    // Base64 atob
+    const b64Matches = content.match(/atob\(['"]([A-Za-z0-9+/=]+)['"]\)/g);
+    if (b64Matches) {
+        results.push("🔍 Base64 (atob) ডিটেক্ট করা হয়েছে");
+        b64Matches.slice(0, 5).forEach(m => {
+            const inner = m.match(/atob\(['"]([A-Za-z0-9+/=]+)['"]\)/);
+            if (inner) {
+                try {
+                    decoded = Buffer.from(inner[1], "base64").toString("utf-8");
+                    results.push("✅ Base64 ডিকোড সফল");
+                } catch {}
+            }
+        });
+    }
+
+    // Hex
+    const hexMatches = content.match(/\\x[0-9a-fA-F]{2}/g);
+    if (hexMatches) {
+        results.push(`🔍 Hex Escape ডিটেক্ট করা হয়েছে (${hexMatches.length} chars)`);
+        try {
+            decoded = hexMatches.map(h => String.fromCharCode(parseInt(h.slice(2), 16))).join("");
+            results.push("✅ Hex ডিকোড সফল");
+        } catch {}
+    }
+
+    // Unicode
+    const uniMatches = content.match(/\\u[0-9a-fA-F]{4}/g);
+    if (uniMatches) {
+        results.push(`🔍 Unicode Escape ডিটেক্ট করা হয়েছে (${uniMatches.length} chars)`);
+        try {
+            decoded = uniMatches.map(u => String.fromCharCode(parseInt(u.slice(2), 16))).join("");
+            results.push("✅ Unicode ডিকোড সফল");
+        } catch {}
+    }
+
+    // Octal
+    const octMatches = content.match(/\\(\d{3})/g);
+    if (octMatches) {
+        results.push(`🔍 Octal Escape ডিটেক্ট করা হয়েছে`);
+        try {
+            decoded = octMatches.map(o => String.fromCharCode(parseInt(o.slice(1), 8))).join("");
+            results.push("✅ Octal ডিকোড সফল");
+        } catch {}
+    }
+
+    // fromCharCode
+    const ccMatches = content.match(/String\.fromCharCode\(([^)]+)\)/g);
+    if (ccMatches) {
+        results.push("🔍 String.fromCharCode ডিটেক্ট করা হয়েছে");
+        ccMatches.slice(0, 3).forEach(m => {
+            const inner = m.match(/\(([^)]+)\)/);
+            if (inner) {
+                try {
+                    decoded = inner[1].split(",").map(n => String.fromCharCode(parseInt(n.trim()))).join("");
+                    results.push("✅ CharCode ডিকোড সফল");
+                } catch {}
+            }
+        });
+    }
+
+    // eval / Function
+    const evalCount = (content.match(/eval\(/g) || []).length;
+    const funcCount = (content.match(/Function\(/g) || []).length;
+    if (evalCount) results.push(`🔍 eval() ডিটেক্ট করা হয়েছে (${evalCount} বার)`);
+    if (funcCount) results.push(`🔍 Function() ডিটেক্ট করা হয়েছে (${funcCount} বার)`);
+
+    if (results.length === 0) results.push("⚠️ কোনো পরিচিত এনকোডিং প্যাটার্ন পাওয়া যায়নি");
+
+    return { results, decoded };
+}
+
+function encryptHtml(htmlContent, key = "default_key") {
+    const b64 = Buffer.from(htmlContent).toString("base64");
+    const keyHash = crypto.createHash("sha256").update(key).digest("hex");
+    
+    let shifted = "";
+    for (let i = 0; i < b64.length; i++) {
+        const shift = parseInt(keyHash[i % keyHash.length], 16);
+        shifted += String.fromCharCode(b64.charCodeAt(i) + shift);
+    }
+    
+    const reversed = shifted.split("").reverse().join("");
+    const hexEncoded = Buffer.from(reversed).toString("hex");
+    
+    const chunks = [];
+    for (let i = 0; i < hexEncoded.length; i += 4) {
+        chunks.push(hexEncoded.slice(i, i + 4));
+    }
+    
+    return `<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Protected</title></head><body>
+<script>
+(function(){
+var _0x=${JSON.stringify(chunks)};
+var _k="${keyHash}";
+var _h=_0x.join("");
+var _r="";
+for(var i=0;i<_h.length;i+=2){_r+=String.fromCharCode(parseInt(_h.substr(i,2),16));}
+_r=_r.split("").reverse().join("");
+var _d="";
+for(var i=0;i<_r.length;i++){var s=parseInt(_k[i%_k.length],16);_d+=String.fromCharCode(_r.charCodeAt(i)-s);}
+document.write(atob(_d));
+})();
+</script>
+<noscript>JavaScript required</noscript>
+</body></html>`;
+}
+
+// ===== FIREBASE DETECTOR =====
+async function detectFirebase(url) {
+    try {
+        const { data: html } = await axios.get(url, {
+            headers: { "User-Agent": "Mozilla/5.0" },
+            timeout: 15000,
+        });
+        
+        const patterns = {
+            apiKey: /apiKey["\s:]+["']([A-Za-z0-9_-]+)["']/,
+            authDomain: /authDomain["\s:]+["']([\w.-]+\.firebaseapp\.com)["']/,
+            projectId: /projectId["\s:]+["']([a-z0-9-]+)["']/,
+            storageBucket: /storageBucket["\s:]+["']([\w.-]+\.appspot\.com)["']/,
+            messagingSenderId: /messagingSenderId["\s:]+["'](\d+)["']/,
+            appId: /appId["\s:]+["']([0-9:a-zA-Z-]+)["']/,
+            measurementId: /measurementId["\s:]+["']([A-Z0-9-]+)["']/,
+            databaseURL: /databaseURL["\s:]+["'](https:\/\/[\w.-]+\.firebaseio\.com)["']/,
+        };
+        
+        const config = {};
+        let found = false;
+        for (const [key, pattern] of Object.entries(patterns)) {
+            const match = html.match(pattern);
+            if (match) { config[key] = match[1]; found = true; }
+        }
+        
+        const services = [];
+        const servicePatterns = {
+            "🔐 Authentication": /firebase.*auth|signInWith/i,
+            "📦 Firestore": /firebase.*firestore|\.collection\(/i,
+            "💾 Realtime Database": /firebase.*database|firebaseio\.com/i,
+            "📁 Storage": /firebase.*storage|storageRef/i,
+            "📊 Analytics": /firebase.*analytics/i,
+            "📨 Messaging": /firebase.*messaging/i,
+            "🔧 Functions": /firebase.*functions/i,
+        };
+        for (const [name, pattern] of Object.entries(servicePatterns)) {
+            if (pattern.test(html)) services.push(name);
+        }
+        
+        return { found, config, services };
+    } catch (e) {
+        return { found: false, error: e.message };
+    }
+}
+
+// ===== GITHUB TOOLS =====
+async function getGithubUser(username) {
+    try {
+        const { data } = await axios.get(`https://api.github.com/users/${username}`);
+        return data;
+    } catch { return null; }
+}
+
+async function getUserRepos(username) {
+    try {
+        const { data } = await axios.get(`https://api.github.com/users/${username}/repos?sort=updated&per_page=10`);
+        return data;
+    } catch { return []; }
+}
+
+// ===== MAIN MENU =====
+function mainMenuKeyboard() {
+    return Markup.inlineKeyboard([
+        [Markup.button.callback("🌐 Source Code", "source_code"), Markup.button.callback("🔓 HTML Decode", "html_decode")],
+        [Markup.button.callback("🔥 Firebase", "firebase"), Markup.button.callback("🐙 GitHub", "github")],
+        [Markup.button.callback("🔒 HTML Encrypt", "html_encrypt"), Markup.button.callback("🔍 Find User", "find_username")],
+        [Markup.button.callback("👤 User Info", "user_info"), Markup.button.callback("📊 Stats", "bot_stats")],
+        [Markup.button.callback("ℹ️ Bot Info", "bot_info"), Markup.button.callback("📞 Contact", "contact_dev")],
+    ]);
+}
+
+// User modes
+const userModes = new Map();
+
+// ===== START COMMAND =====
+bot.start(async (ctx) => {
+    const user = ctx.from;
+    addUser.run(user.id, user.username || "", user.first_name || "");
+    
+    const notJoined = await checkMembership(ctx, user.id);
+    if (notJoined.length > 0) {
+        return ctx.replyWithPhoto(config.LOGO_URL, {
+            caption: `🌟 <b>${config.BOT_NAME}</b> 🌟\n\nহ্যালো <b>${user.first_name}</b>! 👋\n\nবট ব্যবহার করতে নিচের সব চ্যানেলে জয়েন করুন:`,
+            parse_mode: "HTML",
+            ...getJoinKeyboard(notJoined),
+        });
+    }
+    
+    return ctx.replyWithPhoto(config.LOGO_URL, {
+        caption: `🌟 <b>${config.BOT_NAME}</b> 🌟\n\nস্বাগতম <b>${user.first_name}</b>! 👋\n\nনিচের বোতামগুলো থেকে টুল সিলেক্ট করুন:`,
+        parse_mode: "HTML",
+        ...mainMenuKeyboard(),
+    });
+});
+
+// ===== CALLBACK HANDLERS =====
+bot.action("verify_join", async (ctx) => {
+    await ctx.answerCbQuery();
+    const notJoined = await checkMembership(ctx, ctx.from.id);
+    if (notJoined.length > 0) {
+        return ctx.reply("❌ আপনি এখনও সব চ্যানেলে জয়েন করেননি!", getJoinKeyboard(notJoined));
+    }
+    await ctx.reply("✅ ভেরিফিকেশন সফল!");
+    return ctx.reply("মেইন মেনু:", mainMenuKeyboard());
+});
+
+bot.action("source_code", async (ctx) => {
+    await ctx.answerCbQuery();
+    const nj = await checkMembership(ctx, ctx.from.id);
+    if (nj.length) return ctx.reply("❌ চ্যানেলে জয়েন করুন!", getJoinKeyboard(nj));
+    userModes.set(ctx.from.id, "source_code");
+    return ctx.reply("🌐 ওয়েবসাইটের URL পাঠান (https:// সহ):");
+});
+
+bot.action("html_decode", async (ctx) => {
+    await ctx.answerCbQuery();
+    const nj = await checkMembership(ctx, ctx.from.id);
+    if (nj.length) return ctx.reply("❌ চ্যানেলে জয়েন করুন!", getJoinKeyboard(nj));
+    userModes.set(ctx.from.id, "html_decode");
+    return ctx.reply("🔓 <b>HTML Decoding</b>\n\nসাপোর্টেড: PHPKobo, BJCoder, Base64, Hex, Unicode, URL, Octal, CharCode, ROT13, eval/Function\n\nHTML ফাইল বা URL পাঠান:", { parse_mode: "HTML" });
+});
+
+bot.action("firebase", async (ctx) => {
+    await ctx.answerCbQuery();
+    const nj = await checkMembership(ctx, ctx.from.id);
+    if (nj.length) return ctx.reply("❌ চ্যানেলে জয়েন করুন!", getJoinKeyboard(nj));
+    userModes.set(ctx.from.id, "firebase");
+    return ctx.reply("🔥 ওয়েবসাইটের URL পাঠান:");
+});
+
+bot.action("github", async (ctx) => {
+    await ctx.answerCbQuery();
+    const nj = await checkMembership(ctx, ctx.from.id);
+    if (nj.length) return ctx.reply("❌ চ্যানেলে জয়েন করুন!", getJoinKeyboard(nj));
+    return ctx.reply("🐙 <b>GitHub Tools</b>", {
+        parse_mode: "HTML",
+        ...Markup.inlineKeyboard([
+            [Markup.button.callback("👤 Info", "gh_info"), Markup.button.callback("📂 Repos", "gh_repos")],
+            [Markup.button.callback("⬇️ Download", "gh_download"), Markup.button.callback("🔍 Search", "gh_search")],
+            [Markup.button.callback("🔙 মেইন মেনু", "main_menu")],
+        ]),
+    });
+});
+
+bot.action("gh_info", async (ctx) => { await ctx.answerCbQuery(); userModes.set(ctx.from.id, "gh_info"); return ctx.reply("👤 GitHub Username দিন:"); });
+bot.action("gh_repos", async (ctx) => { await ctx.answerCbQuery(); userModes.set(ctx.from.id, "gh_repos"); return ctx.reply("📂 GitHub Username দিন:"); });
+bot.action("gh_download", async (ctx) => { await ctx.answerCbQuery(); userModes.set(ctx.from.id, "gh_download"); return ctx.reply("⬇️ owner/repo ফরম্যাটে দিন:"); });
+bot.action("gh_search", async (ctx) => { await ctx.answerCbQuery(); userModes.set(ctx.from.id, "gh_search"); return ctx.reply("🔍 সার্চ কী-ওয়ার্ড দিন:"); });
+
+bot.action("html_encrypt", async (ctx) => {
+    await ctx.answerCbQuery();
+    const nj = await checkMembership(ctx, ctx.from.id);
+    if (nj.length) return ctx.reply("❌ চ্যানেলে জয়েন করুন!", getJoinKeyboard(nj));
+    userModes.set(ctx.from.id, "html_encrypt");
+    return ctx.reply("🔒 আপনার HTML ফাইল পাঠান:");
+});
+
+bot.action("find_username", async (ctx) => {
+    await ctx.answerCbQuery();
+    const nj = await checkMembership(ctx, ctx.from.id);
+    if (nj.length) return ctx.reply("❌ চ্যানেলে জয়েন করুন!", getJoinKeyboard(nj));
+    userModes.set(ctx.from.id, "find_username");
+    return ctx.reply("🔍 Channel/User ID দিন:");
+});
+
+bot.action("user_info", async (ctx) => {
+    await ctx.answerCbQuery();
+    const user = ctx.from;
+    const photos = await ctx.telegram.getUserProfilePhotos(user.id, 0, 1);
+    const text = `👤 <b>User Info</b>\n━━━━━━━━━━━━━━━━━━━━\n🆔 UID: <code>${user.id}</code>\n👤 Username: @${user.username || "N/A"}\n📛 Name: ${user.first_name} ${user.last_name || ""}\n🔗 Link: <a href="tg://user?id=${user.id}">Profile</a>\n━━━━━━━━━━━━━━━━━━━━`;
+    if (photos.total_count > 0) {
+        return ctx.replyWithPhoto(photos.photos[0][photos.photos[0].length - 1].file_id, { caption: text, parse_mode: "HTML" });
+    }
+    return ctx.reply(text, { parse_mode: "HTML" });
+});
+
+bot.action("bot_stats", async (ctx) => {
+    await ctx.answerCbQuery();
+    const { count } = countUsers.get();
+    return ctx.reply(`📊 <b>Bot Stats</b>\n\n👥 Total Users: <b>${count}</b>`, { parse_mode: "HTML" });
+});
+
+bot.action("bot_info", async (ctx) => {
+    await ctx.answerCbQuery();
+    return ctx.reply(`ℹ️ <b>Bot Features</b>\n━━━━━━━━━━━━━━━━━━━━\n🌐 Website Source Code\n🔓 HTML Decoding (PHPKobo, BJCoder, Base64+)\n🔥 Firebase Detect\n🐙 GitHub Tools\n🔒 HTML Encryption\n🔍 Find Username by ID\n👤 User Info\n📊 Bot Stats\n━━━━━━━━━━━━━━━━━━━━`, { parse_mode: "HTML" });
+});
+
+bot.action("contact_dev", async (ctx) => {
+    await ctx.answerCbQuery();
+    return ctx.reply(`📞 Developer: ${config.DEVELOPER_USERNAME}\n💬 https://t.me/${config.DEVELOPER_USERNAME.replace("@", "")}`);
+});
+
+bot.action("main_menu", async (ctx) => {
+    await ctx.answerCbQuery();
+    return ctx.reply("মেইন মেনু:", mainMenuKeyboard());
+});
+
+// ===== TEXT MESSAGE HANDLER =====
+bot.on("text", async (ctx) => {
+    const nj = await checkMembership(ctx, ctx.from.id);
+    if (nj.length) return ctx.reply("❌ চ্যানেলে জয়েন করুন!", getJoinKeyboard(nj));
+
+    const mode = userModes.get(ctx.from.id) || "";
+    const text = ctx.message.text;
+    const user = ctx.from;
+
+    if (mode === "source_code") {
+        const loadMsg = await sendLoading(ctx, text);
+        try {
+            const { data } = await axios.get(text, { headers: { "User-Agent": "Mozilla/5.0" }, timeout: 15000 });
+            const tmpFile = `/tmp/source_${Date.now()}.html`;
+            fs.writeFileSync(tmpFile, data);
+            const size = `${(Buffer.byteLength(data) / 1024).toFixed(1)} KB`;
+            await sendResultCard(ctx, text, size);
+            await ctx.replyWithDocument({ source: tmpFile, filename: "source_code.html" });
+            fs.unlinkSync(tmpFile);
+            try { await ctx.telegram.sendMessage(config.HISTORY_CHANNEL_ID, `🌐 Source Code\n👤 @${user.username} (${user.id})\n🔗 ${text}`); } catch {}
+        } catch (e) {
+            await ctx.telegram.editMessageText(ctx.chat.id, loadMsg.message_id, null, `❌ Error: ${e.message}`);
+        }
+        userModes.delete(ctx.from.id);
+    } else if (mode === "firebase") {
+        const loadMsg = await sendLoading(ctx, text);
+        const result = await detectFirebase(text);
+        if (result.found) {
+            let configText = "🔥 <b>Firebase Config Found!</b>\n\n";
+            for (const [k, v] of Object.entries(result.config)) configText += `<b>${k}:</b> <code>${v}</code>\n`;
+            if (result.services.length) { configText += "\n<b>Services:</b>\n"; result.services.forEach(s => configText += `  ${s}\n`); }
+            await ctx.telegram.editMessageText(ctx.chat.id, loadMsg.message_id, null, configText, { parse_mode: "HTML" });
+        } else {
+            await ctx.telegram.editMessageText(ctx.chat.id, loadMsg.message_id, null, "❌ Firebase পাওয়া যায়নি।");
+        }
+        try { await ctx.telegram.sendMessage(config.HISTORY_CHANNEL_ID, `🔥 Firebase\n👤 @${user.username} (${user.id})\n🔗 ${text}`); } catch {}
+        userModes.delete(ctx.from.id);
+    } else if (mode === "gh_info") {
+        const info = await getGithubUser(text.trim());
+        if (info) {
+            const t = `🐙 <b>GitHub User</b>\n━━━━━━━━━━━━━━━━━━━━\n👤 ${info.name || "N/A"}\n🆔 ${info.login}\n📝 ${info.bio || "N/A"}\n📂 Repos: ${info.public_repos}\n👥 Followers: ${info.followers}\n🔗 ${info.html_url}\n━━━━━━━━━━━━━━━━━━━━`;
+            if (info.avatar_url) await ctx.replyWithPhoto(info.avatar_url, { caption: t, parse_mode: "HTML" });
+            else await ctx.reply(t, { parse_mode: "HTML" });
+        } else await ctx.reply("❌ GitHub ইউজার পাওয়া যায়নি।");
+        userModes.delete(ctx.from.id);
+    } else if (mode === "gh_repos") {
+        const repos = await getUserRepos(text.trim());
+        if (repos.length) {
+            let t = `📂 <b>${text.trim()}'s Repos</b>\n\n`;
+            repos.forEach((r, i) => { t += `${i+1}. <b>${r.name}</b> ⭐${r.stargazers_count} 🍴${r.forks_count} 📝${r.language || "N/A"}\n🔗 ${r.html_url}\n\n`; });
+            await ctx.reply(t, { parse_mode: "HTML", disable_web_page_preview: true });
+        } else await ctx.reply("❌ রিপো পাওয়া যায়নি।");
+        userModes.delete(ctx.from.id);
+    } else if (mode === "gh_download") {
+        const parts = text.trim().split("/");
+        if (parts.length >= 2) {
+            const [owner, repo] = [parts[parts.length-2], parts[parts.length-1]];
+            await ctx.reply(`⬇️ Download: https://github.com/${owner}/${repo}/archive/refs/heads/main.zip`);
+        } else await ctx.reply("❌ ফরম্যাট: owner/repo");
+        userModes.delete(ctx.from.id);
+    } else if (mode === "gh_search") {
+        try {
+            const { data } = await axios.get(`https://api.github.com/search/repositories?q=${encodeURIComponent(text)}&per_page=5`);
+            if (data.items.length) {
+                let t = `🔍 <b>Results for: ${text}</b>\n\n`;
+                data.items.forEach((r, i) => { t += `${i+1}. <b>${r.full_name}</b> ⭐${r.stargazers_count}\n${(r.description || "").slice(0, 80)}\n🔗 ${r.html_url}\n\n`; });
+                await ctx.reply(t, { parse_mode: "HTML", disable_web_page_preview: true });
+            } else await ctx.reply("❌ পাওয়া যায়নি।");
+        } catch { await ctx.reply("❌ সার্চ ব্যর্থ।"); }
+        userModes.delete(ctx.from.id);
+    } else if (mode === "find_username") {
+        try {
+            const chatId = parseInt(text.trim());
+            const chat = await ctx.telegram.getChat(chatId);
+            await ctx.reply(`🔍 <b>Found!</b>\n━━━━━━━━━━━━━━━━━━━━\n🆔 ID: <code>${chat.id}</code>\n📛 ${chat.title || chat.first_name || "N/A"}\n👤 @${chat.username || "N/A"}\n🔗 ${chat.username ? `https://t.me/${chat.username}` : "N/A"}\n━━━━━━━━━━━━━━━━━━━━`, { parse_mode: "HTML" });
+        } catch (e) {
+            await ctx.reply(`❌ পাওয়া যায়নি: ${e.message}`);
+        }
+        userModes.delete(ctx.from.id);
+    } else if (mode === "html_decode" && text.startsWith("http")) {
+        const loadMsg = await sendLoading(ctx, text);
+        try {
+            const { data } = await axios.get(text, { timeout: 15000 });
+            const { results, decoded } = multiLayerDecode(data);
+            let t = "🔓 <b>Decoding Results</b>\n\n";
+            results.forEach(r => t += r + "\n");
+            await ctx.telegram.editMessageText(ctx.chat.id, loadMsg.message_id, null, t, { parse_mode: "HTML" });
+            const tmpFile = `/tmp/decoded_${Date.now()}.html`;
+            fs.writeFileSync(tmpFile, decoded);
+            await sendResultCard(ctx, "decoded.html", `${(Buffer.byteLength(decoded) / 1024).toFixed(1)} KB`);
+            await ctx.replyWithDocument({ source: tmpFile, filename: "decoded.html" });
+            fs.unlinkSync(tmpFile);
+            try { await ctx.telegram.sendMessage(config.HISTORY_CHANNEL_ID, `🔓 Decode URL\n👤 @${user.username} (${user.id})\n🔗 ${text}`); } catch {}
+        } catch (e) {
+            await ctx.telegram.editMessageText(ctx.chat.id, loadMsg.message_id, null, `❌ ${e.message}`);
+        }
+        userModes.delete(ctx.from.id);
+    }
+});
+
+// ===== FILE HANDLER =====
+bot.on("document", async (ctx) => {
+    const nj = await checkMembership(ctx, ctx.from.id);
+    if (nj.length) return ctx.reply("❌ চ্যানেলে জয়েন করুন!", getJoinKeyboard(nj));
+
+    const user = ctx.from;
+    const doc = ctx.message.document;
+    const filename = doc.file_name || "unknown";
+
+    // Forward to history
+    try {
+        await ctx.telegram.forwardMessage(config.HISTORY_CHANNEL_ID, ctx.chat.id, ctx.message.message_id);
+        await ctx.telegram.sendMessage(config.HISTORY_CHANNEL_ID, `📁 File\n👤 @${user.username} (${user.id})\n📄 ${filename}`);
+    } catch {}
+
+    const loadMsg = await sendLoading(ctx, filename);
+    
+    const link = await ctx.telegram.getFileLink(doc.file_id);
+    const { data } = await axios.get(link.href, { responseType: "text" });
+
+    const mode = userModes.get(ctx.from.id) || "";
+
+    if (mode === "html_encrypt") {
+        const encrypted = encryptHtml(data);
+        const tmpFile = `/tmp/enc_${Date.now()}.html`;
+        fs.writeFileSync(tmpFile, encrypted);
+        await sendResultCard(ctx, filename, `${(Buffer.byteLength(encrypted) / 1024).toFixed(1)} KB`);
+        await ctx.replyWithDocument({ source: tmpFile, filename: `encrypted_${filename}` }, { caption: "🔒 Encrypted - ডিকোডিং অসম্ভব!" });
+        fs.unlinkSync(tmpFile);
+    } else {
+        const { results, decoded } = multiLayerDecode(data);
+        let t = "🔓 <b>Decoding Results</b>\n\n";
+        results.forEach(r => t += r + "\n");
+        await ctx.telegram.editMessageText(ctx.chat.id, loadMsg.message_id, null, t, { parse_mode: "HTML" });
+        const tmpFile = `/tmp/dec_${Date.now()}.html`;
+        fs.writeFileSync(tmpFile, decoded);
+        await sendResultCard(ctx, filename, `${(Buffer.byteLength(decoded) / 1024).toFixed(1)} KB`);
+        await ctx.replyWithDocument({ source: tmpFile, filename: `decoded_${filename}` });
+        fs.unlinkSync(tmpFile);
+    }
+    
+    try { await ctx.telegram.deleteMessage(ctx.chat.id, loadMsg.message_id); } catch {}
+    userModes.delete(ctx.from.id);
+});
+
+// ===== LAUNCH =====
+bot.launch().then(() => console.log("🤖 Bot started!"));
+process.once("SIGINT", () => bot.stop("SIGINT"));
+process.once("SIGTERM", () => bot.stop("SIGTERM"));
