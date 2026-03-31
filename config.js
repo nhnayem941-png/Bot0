@@ -1,5 +1,5 @@
 module.exports = {
-    BOT_TOKEN: "8298011227:AAHkIJoSoOKp_wrNbyMRa9bx_mAE3Xljk08",
+    BOT_TOKEN: "8756910275:AAEuFys4sN-_a5t4ZErMsTnnlC5WGrC5RZk",
     
     CHANNELS: [
         "@MASTER_MIND_TEAM",
@@ -8,7 +8,7 @@ module.exports = {
         "@TOMS_BIO",
     ],
     
-    DEVELOPER_USERNAME: "@ERROR_404_SYSTEM",
+    DEVELOPER_USERNAME: "@Baby_DEC_ROBOT",
     DEVELOPER_CHAT_ID: 8345175438,
     HISTORY_CHANNEL_ID: -1003532004167,
     
