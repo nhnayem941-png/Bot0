@@ -5,6 +5,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const { URL } = require("url");
+const vm = require("vm");
 
 const config = require("./config");
 
@@ -40,11 +41,18 @@ async function checkMembership(ctx, userId) {
 }
 
 function getJoinKeyboard(notJoined) {
-    const buttons = notJoined.map(ch => [
-        Markup.button.url(`📢 Join ${ch}`, `https://t.me/${ch.replace("@", "")}`)
-    ]);
-    buttons.push([Markup.button.callback("✅ ভেরিফাই করুন", "verify_join")]);
-    return Markup.inlineKeyboard(buttons);
+    const rows = [];
+    for (let i = 0; i < notJoined.length; i += 2) {
+        const row = [
+            Markup.button.url(`📢 Join Channel ${i + 1}`, `https://t.me/${notJoined[i].replace("@", "")}`)
+        ];
+        if (i + 1 < notJoined.length) {
+            row.push(Markup.button.url(`📢 Join Channel ${i + 2}`, `https://t.me/${notJoined[i + 1].replace("@", "")}`));
+        }
+        rows.push(row);
+    }
+    rows.push([Markup.button.callback("✅ ভেরিফাই করুন", "verify_join")]);
+    return Markup.inlineKeyboard(rows);
 }
 
 // ===== LOADING ANIMATION =====
@@ -86,87 +94,237 @@ async function sendResultCard(ctx, filename, fileSize = "N/A") {
     await ctx.reply(text);
 }
 
-// ===== DECODERS =====
+// ===== ADVANCED DECODERS =====
+
+// Execute obfuscated JS in sandbox to extract decoded HTML
+function sandboxDecode(content) {
+    let decodedOutput = null;
+
+    // Create a fake document.write / document.open / document.close context
+    const fakeDocument = {
+        _output: "",
+        write(str) { this._output += str; },
+        writeln(str) { this._output += str + "\n"; },
+        open() { this._output = ""; },
+        close() {},
+        characterSet: "UTF-8",
+        charset: "UTF-8",
+    };
+
+    const fakeWindow = {
+        document: fakeDocument,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        location: { href: "about:blank", hostname: "localhost" },
+        navigator: { userAgent: "Mozilla/5.0" },
+        console: { log: () => {}, error: () => {}, warn: () => {} },
+        atob: (s) => Buffer.from(s, "base64").toString("binary"),
+        btoa: (s) => Buffer.from(s, "binary").toString("base64"),
+        setTimeout: () => 0,
+        setInterval: () => 0,
+        clearTimeout: () => {},
+        clearInterval: () => {},
+        RegExp: RegExp,
+        String: String,
+        Array: Array,
+        Object: Object,
+        Math: Math,
+        parseInt: parseInt,
+        parseFloat: parseFloat,
+        isNaN: isNaN,
+        encodeURIComponent: encodeURIComponent,
+        decodeURIComponent: decodeURIComponent,
+        escape: escape,
+        unescape: unescape,
+    };
+
+    // Extract all <script> content
+    const scriptRegex = /<script[^>]*>([\s\S]*?)<\/script>/gi;
+    let scripts = [];
+    let match;
+    while ((match = scriptRegex.exec(content)) !== null) {
+        if (match[1].trim()) scripts.push(match[1]);
+    }
+
+    // Also try if entire content is JS (no HTML wrapper)
+    if (scripts.length === 0 && (content.includes("eval(") || content.includes("Function(") || content.includes("document.write"))) {
+        scripts.push(content);
+    }
+
+    for (const script of scripts) {
+        try {
+            // Replace eval/Function calls to capture output
+            let modifiedScript = script;
+
+            // Replace eval() with a function that captures
+            modifiedScript = modifiedScript.replace(/\beval\s*\(/g, "(function(code){ try { return (new Function(code))(); } catch(e) { return code; } })(");
+
+            const sandbox = {
+                ...fakeWindow,
+                window: fakeWindow,
+                document: fakeDocument,
+                self: fakeWindow,
+                this: fakeWindow,
+                global: fakeWindow,
+            };
+
+            const context = vm.createContext(sandbox);
+            vm.runInContext(modifiedScript, context, { timeout: 10000 });
+
+            if (fakeDocument._output && fakeDocument._output.trim().length > 10) {
+                decodedOutput = fakeDocument._output;
+                break;
+            }
+        } catch (e) {
+            // Try alternative: replace document.write with capture
+            try {
+                let altScript = script;
+                // Intercept document.write by wrapping
+                const wrappedScript = `
+                    var __captured = "";
+                    var __origWrite = document.write.bind(document);
+                    document.write = function(s) { __captured += s; __origWrite(s); };
+                    document.writeln = function(s) { __captured += s + "\\n"; __origWrite(s); };
+                    ${altScript}
+                `;
+                const sandbox2 = {
+                    ...fakeWindow,
+                    window: fakeWindow,
+                    document: { ...fakeDocument, _output: "" },
+                    self: fakeWindow,
+                };
+                const context2 = vm.createContext(sandbox2);
+                vm.runInContext(wrappedScript, context2, { timeout: 10000 });
+                if (sandbox2.document._output && sandbox2.document._output.trim().length > 10) {
+                    decodedOutput = sandbox2.document._output;
+                    break;
+                }
+            } catch {}
+        }
+    }
+
+    return decodedOutput;
+}
+
 function multiLayerDecode(content) {
     const results = [];
     let decoded = content;
+    let wasDecoded = false;
 
+    // Detection
     if (/phpkobo|html-obfuscator/i.test(content)) {
         results.push("🔍 PHPKobo Obfuscation ডিটেক্ট করা হয়েছে");
     }
-    if (/bj\s*coder|bjcoder/i.test(content)) {
+    if (/bj\s*coder|bjcoder|BJ-ENC/i.test(content)) {
         results.push("🔍 BJ Coder Encryption ডিটেক্ট করা হয়েছে");
     }
 
-    // Base64 atob
-    const b64Matches = content.match(/atob\(['"]([A-Za-z0-9+/=]+)['"]\)/g);
-    if (b64Matches) {
-        results.push("🔍 Base64 (atob) ডিটেক্ট করা হয়েছে");
-        b64Matches.slice(0, 5).forEach(m => {
-            const inner = m.match(/atob\(['"]([A-Za-z0-9+/=]+)['"]\)/);
-            if (inner) {
-                try {
-                    decoded = Buffer.from(inner[1], "base64").toString("utf-8");
-                    results.push("✅ Base64 ডিকোড সফল");
-                } catch {}
-            }
-        });
-    }
-
-    // Hex
-    const hexMatches = content.match(/\\x[0-9a-fA-F]{2}/g);
-    if (hexMatches) {
-        results.push(`🔍 Hex Escape ডিটেক্ট করা হয়েছে (${hexMatches.length} chars)`);
-        try {
-            decoded = hexMatches.map(h => String.fromCharCode(parseInt(h.slice(2), 16))).join("");
-            results.push("✅ Hex ডিকোড সফল");
-        } catch {}
-    }
-
-    // Unicode
-    const uniMatches = content.match(/\\u[0-9a-fA-F]{4}/g);
-    if (uniMatches) {
-        results.push(`🔍 Unicode Escape ডিটেক্ট করা হয়েছে (${uniMatches.length} chars)`);
-        try {
-            decoded = uniMatches.map(u => String.fromCharCode(parseInt(u.slice(2), 16))).join("");
-            results.push("✅ Unicode ডিকোড সফল");
-        } catch {}
-    }
-
-    // Octal
-    const octMatches = content.match(/\\(\d{3})/g);
-    if (octMatches) {
-        results.push(`🔍 Octal Escape ডিটেক্ট করা হয়েছে`);
-        try {
-            decoded = octMatches.map(o => String.fromCharCode(parseInt(o.slice(1), 8))).join("");
-            results.push("✅ Octal ডিকোড সফল");
-        } catch {}
-    }
-
-    // fromCharCode
-    const ccMatches = content.match(/String\.fromCharCode\(([^)]+)\)/g);
-    if (ccMatches) {
-        results.push("🔍 String.fromCharCode ডিটেক্ট করা হয়েছে");
-        ccMatches.slice(0, 3).forEach(m => {
-            const inner = m.match(/\(([^)]+)\)/);
-            if (inner) {
-                try {
-                    decoded = inner[1].split(",").map(n => String.fromCharCode(parseInt(n.trim()))).join("");
-                    results.push("✅ CharCode ডিকোড সফল");
-                } catch {}
-            }
-        });
-    }
-
-    // eval / Function
     const evalCount = (content.match(/eval\(/g) || []).length;
     const funcCount = (content.match(/Function\(/g) || []).length;
     if (evalCount) results.push(`🔍 eval() ডিটেক্ট করা হয়েছে (${evalCount} বার)`);
     if (funcCount) results.push(`🔍 Function() ডিটেক্ট করা হয়েছে (${funcCount} বার)`);
 
+    // Try sandbox execution first (most reliable for obfuscated HTML)
+    const sandboxResult = sandboxDecode(content);
+    if (sandboxResult) {
+        decoded = sandboxResult;
+        results.push("✅ Sandbox Execution দিয়ে ডিকোড সফল!");
+        wasDecoded = true;
+
+        // Try multi-layer: if decoded output also has scripts, decode again
+        for (let layer = 2; layer <= 5; layer++) {
+            if (/<script/i.test(decoded) && (decoded.includes("eval(") || decoded.includes("document.write") || decoded.includes("Function("))) {
+                const nextLayer = sandboxDecode(decoded);
+                if (nextLayer && nextLayer !== decoded) {
+                    decoded = nextLayer;
+                    results.push(`✅ Layer ${layer} ডিকোড সফল!`);
+                } else break;
+            } else break;
+        }
+    }
+
+    if (!wasDecoded) {
+        // Fallback: manual pattern decoding
+        // Base64 atob
+        const b64Matches = content.match(/atob\(['"]([A-Za-z0-9+/=]+)['"]\)/g);
+        if (b64Matches) {
+            results.push("🔍 Base64 (atob) ডিটেক্ট করা হয়েছে");
+            b64Matches.forEach(m => {
+                const inner = m.match(/atob\(['"]([A-Za-z0-9+/=]+)['"]\)/);
+                if (inner) {
+                    try {
+                        const d = Buffer.from(inner[1], "base64").toString("utf-8");
+                        if (d.length > decoded.length * 0.1) {
+                            decoded = d;
+                            wasDecoded = true;
+                        }
+                        results.push("✅ Base64 ডিকোড সফল");
+                    } catch {}
+                }
+            });
+        }
+
+        // Hex
+        const hexMatches = content.match(/\\x[0-9a-fA-F]{2}/g);
+        if (hexMatches && hexMatches.length > 10) {
+            results.push(`🔍 Hex Escape ডিটেক্ট করা হয়েছে (${hexMatches.length} chars)`);
+            try {
+                const hexDecoded = content.replace(/\\x([0-9a-fA-F]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+                if (hexDecoded !== content) {
+                    decoded = hexDecoded;
+                    wasDecoded = true;
+                    results.push("✅ Hex ডিকোড সফল");
+                }
+            } catch {}
+        }
+
+        // Unicode
+        const uniMatches = content.match(/\\u[0-9a-fA-F]{4}/g);
+        if (uniMatches && uniMatches.length > 5) {
+            results.push(`🔍 Unicode Escape ডিটেক্ট করা হয়েছে (${uniMatches.length} chars)`);
+            try {
+                const uniDecoded = content.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+                if (uniDecoded !== content) {
+                    decoded = uniDecoded;
+                    wasDecoded = true;
+                    results.push("✅ Unicode ডিকোড সফল");
+                }
+            } catch {}
+        }
+
+        // Octal in strings
+        const octMatches = content.match(/\\(\d{3})/g);
+        if (octMatches && octMatches.length > 5) {
+            results.push(`🔍 Octal Escape ডিটেক্ট করা হয়েছে`);
+            try {
+                const octDecoded = content.replace(/\\(\d{3})/g, (_, oct) => String.fromCharCode(parseInt(oct, 8)));
+                if (octDecoded !== content) {
+                    decoded = octDecoded;
+                    wasDecoded = true;
+                    results.push("✅ Octal ডিকোড সফল");
+                }
+            } catch {}
+        }
+
+        // fromCharCode
+        const ccMatches = content.match(/String\.fromCharCode\(([^)]+)\)/g);
+        if (ccMatches) {
+            results.push("🔍 String.fromCharCode ডিটেক্ট করা হয়েছে");
+            ccMatches.forEach(m => {
+                const inner = m.match(/\(([^)]+)\)/);
+                if (inner) {
+                    try {
+                        const d = inner[1].split(",").map(n => String.fromCharCode(parseInt(n.trim()))).join("");
+                        results.push("✅ CharCode ডিকোড সফল");
+                    } catch {}
+                }
+            });
+        }
+    }
+
     if (results.length === 0) results.push("⚠️ কোনো পরিচিত এনকোডিং প্যাটার্ন পাওয়া যায়নি");
 
-    return { results, decoded };
+    return { results, decoded, wasDecoded };
 }
 
 function encryptHtml(htmlContent, key = "default_key") {
@@ -210,43 +368,62 @@ document.write(atob(_d));
 async function detectFirebase(url) {
     try {
         const { data: html } = await axios.get(url, {
-            headers: { "User-Agent": "Mozilla/5.0" },
+            headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" },
             timeout: 15000,
+            maxRedirects: 5,
         });
         
         const patterns = {
-            apiKey: /apiKey["\s:]+["']([A-Za-z0-9_-]+)["']/,
-            authDomain: /authDomain["\s:]+["']([\w.-]+\.firebaseapp\.com)["']/,
-            projectId: /projectId["\s:]+["']([a-z0-9-]+)["']/,
-            storageBucket: /storageBucket["\s:]+["']([\w.-]+\.appspot\.com)["']/,
-            messagingSenderId: /messagingSenderId["\s:]+["'](\d+)["']/,
-            appId: /appId["\s:]+["']([0-9:a-zA-Z-]+)["']/,
-            measurementId: /measurementId["\s:]+["']([A-Z0-9-]+)["']/,
-            databaseURL: /databaseURL["\s:]+["'](https:\/\/[\w.-]+\.firebaseio\.com)["']/,
+            apiKey: /apiKey["\s:=]+["']([A-Za-z0-9_-]+)["']/,
+            authDomain: /authDomain["\s:=]+["']([\w.-]+\.firebaseapp\.com)["']/,
+            projectId: /projectId["\s:=]+["']([a-z0-9-]+)["']/,
+            storageBucket: /storageBucket["\s:=]+["']([\w.-]+\.appspot\.com|[\w.-]+\.firebasestorage\.app)["']/,
+            messagingSenderId: /messagingSenderId["\s:=]+["'](\d+)["']/,
+            appId: /appId["\s:=]+["']([0-9:a-zA-Z-]+)["']/,
+            measurementId: /measurementId["\s:=]+["']([A-Z0-9-]+)["']/,
+            databaseURL: /databaseURL["\s:=]+["'](https:\/\/[\w.-]+\.firebaseio\.com)["']/,
         };
         
-        const config = {};
+        const foundConfig = {};
         let found = false;
         for (const [key, pattern] of Object.entries(patterns)) {
             const match = html.match(pattern);
-            if (match) { config[key] = match[1]; found = true; }
+            if (match) { foundConfig[key] = match[1]; found = true; }
+        }
+
+        // Also check in embedded scripts loaded from external URLs
+        if (!found) {
+            const scriptUrls = html.match(/src=["'](https?:\/\/[^"']+\.js[^"']*)["']/gi) || [];
+            for (const srcMatch of scriptUrls.slice(0, 5)) {
+                const srcUrl = srcMatch.match(/src=["'](https?:\/\/[^"']+)["']/);
+                if (!srcUrl) continue;
+                try {
+                    const { data: jsData } = await axios.get(srcUrl[1], { timeout: 10000 });
+                    for (const [key, pattern] of Object.entries(patterns)) {
+                        const m = jsData.match(pattern);
+                        if (m) { foundConfig[key] = m[1]; found = true; }
+                    }
+                    if (found) break;
+                } catch {}
+            }
         }
         
         const services = [];
+        const fullContent = html;
         const servicePatterns = {
-            "🔐 Authentication": /firebase.*auth|signInWith/i,
-            "📦 Firestore": /firebase.*firestore|\.collection\(/i,
+            "🔐 Authentication": /firebase.*auth|signInWith|createUserWith/i,
+            "📦 Firestore": /firebase.*firestore|\.collection\(|\.doc\(/i,
             "💾 Realtime Database": /firebase.*database|firebaseio\.com/i,
-            "📁 Storage": /firebase.*storage|storageRef/i,
-            "📊 Analytics": /firebase.*analytics/i,
+            "📁 Storage": /firebase.*storage|storageRef|getDownloadURL/i,
+            "📊 Analytics": /firebase.*analytics|logEvent/i,
             "📨 Messaging": /firebase.*messaging/i,
-            "🔧 Functions": /firebase.*functions/i,
+            "🔧 Functions": /firebase.*functions|httpsCallable/i,
         };
         for (const [name, pattern] of Object.entries(servicePatterns)) {
-            if (pattern.test(html)) services.push(name);
+            if (pattern.test(fullContent)) services.push(name);
         }
         
-        return { found, config, services };
+        return { found, config: foundConfig, services };
     } catch (e) {
         return { found: false, error: e.message };
     }
@@ -255,27 +432,27 @@ async function detectFirebase(url) {
 // ===== GITHUB TOOLS =====
 async function getGithubUser(username) {
     try {
-        const { data } = await axios.get(`https://api.github.com/users/${username}`);
+        const { data } = await axios.get(`https://api.github.com/users/${username}`, { timeout: 10000 });
         return data;
     } catch { return null; }
 }
 
 async function getUserRepos(username) {
     try {
-        const { data } = await axios.get(`https://api.github.com/users/${username}/repos?sort=updated&per_page=10`);
+        const { data } = await axios.get(`https://api.github.com/users/${username}/repos?sort=updated&per_page=10`, { timeout: 10000 });
         return data;
     } catch { return []; }
 }
 
-// ===== MAIN MENU =====
-function mainMenuKeyboard() {
-    return Markup.inlineKeyboard([
-        [Markup.button.callback("🌐 Source Code", "source_code"), Markup.button.callback("🔓 HTML Decode", "html_decode")],
-        [Markup.button.callback("🔥 Firebase", "firebase"), Markup.button.callback("🐙 GitHub", "github")],
-        [Markup.button.callback("🔒 HTML Encrypt", "html_encrypt"), Markup.button.callback("🔍 Find User", "find_username")],
-        [Markup.button.callback("👤 User Info", "user_info"), Markup.button.callback("📊 Stats", "bot_stats")],
-        [Markup.button.callback("ℹ️ Bot Info", "bot_info"), Markup.button.callback("📞 Contact", "contact_dev")],
-    ]);
+// ===== REPLY KEYBOARD (Main Menu) =====
+function mainMenuReplyKeyboard() {
+    return Markup.keyboard([
+        ["🌐 Source Code", "🔓 HTML Decode"],
+        ["🔥 Firebase", "🐙 GitHub"],
+        ["🔒 HTML Encrypt", "🔍 Find User"],
+        ["👤 User Info", "📊 Stats"],
+        ["ℹ️ Bot Info", "📞 Contact"],
+    ]).resize();
 }
 
 // User modes
@@ -298,7 +475,7 @@ bot.start(async (ctx) => {
     return ctx.replyWithPhoto(config.LOGO_URL, {
         caption: `🌟 <b>${config.BOT_NAME}</b> 🌟\n\nস্বাগতম <b>${user.first_name}</b>! 👋\n\nনিচের বোতামগুলো থেকে টুল সিলেক্ট করুন:`,
         parse_mode: "HTML",
-        ...mainMenuKeyboard(),
+        ...mainMenuReplyKeyboard(),
     });
 });
 
@@ -310,99 +487,15 @@ bot.action("verify_join", async (ctx) => {
         return ctx.reply("❌ আপনি এখনও সব চ্যানেলে জয়েন করেননি!", getJoinKeyboard(notJoined));
     }
     await ctx.reply("✅ ভেরিফিকেশন সফল!");
-    return ctx.reply("মেইন মেনু:", mainMenuKeyboard());
+    return ctx.reply("মেইন মেনু:", mainMenuReplyKeyboard());
 });
 
-bot.action("source_code", async (ctx) => {
-    await ctx.answerCbQuery();
-    const nj = await checkMembership(ctx, ctx.from.id);
-    if (nj.length) return ctx.reply("❌ চ্যানেলে জয়েন করুন!", getJoinKeyboard(nj));
-    userModes.set(ctx.from.id, "source_code");
-    return ctx.reply("🌐 ওয়েবসাইটের URL পাঠান (https:// সহ):");
-});
-
-bot.action("html_decode", async (ctx) => {
-    await ctx.answerCbQuery();
-    const nj = await checkMembership(ctx, ctx.from.id);
-    if (nj.length) return ctx.reply("❌ চ্যানেলে জয়েন করুন!", getJoinKeyboard(nj));
-    userModes.set(ctx.from.id, "html_decode");
-    return ctx.reply("🔓 <b>HTML Decoding</b>\n\nসাপোর্টেড: PHPKobo, BJCoder, Base64, Hex, Unicode, URL, Octal, CharCode, ROT13, eval/Function\n\nHTML ফাইল বা URL পাঠান:", { parse_mode: "HTML" });
-});
-
-bot.action("firebase", async (ctx) => {
-    await ctx.answerCbQuery();
-    const nj = await checkMembership(ctx, ctx.from.id);
-    if (nj.length) return ctx.reply("❌ চ্যানেলে জয়েন করুন!", getJoinKeyboard(nj));
-    userModes.set(ctx.from.id, "firebase");
-    return ctx.reply("🔥 ওয়েবসাইটের URL পাঠান:");
-});
-
-bot.action("github", async (ctx) => {
-    await ctx.answerCbQuery();
-    const nj = await checkMembership(ctx, ctx.from.id);
-    if (nj.length) return ctx.reply("❌ চ্যানেলে জয়েন করুন!", getJoinKeyboard(nj));
-    return ctx.reply("🐙 <b>GitHub Tools</b>", {
-        parse_mode: "HTML",
-        ...Markup.inlineKeyboard([
-            [Markup.button.callback("👤 Info", "gh_info"), Markup.button.callback("📂 Repos", "gh_repos")],
-            [Markup.button.callback("⬇️ Download", "gh_download"), Markup.button.callback("🔍 Search", "gh_search")],
-            [Markup.button.callback("🔙 মেইন মেনু", "main_menu")],
-        ]),
-    });
-});
-
+// GitHub sub-menu (inline keyboard still makes sense here)
 bot.action("gh_info", async (ctx) => { await ctx.answerCbQuery(); userModes.set(ctx.from.id, "gh_info"); return ctx.reply("👤 GitHub Username দিন:"); });
 bot.action("gh_repos", async (ctx) => { await ctx.answerCbQuery(); userModes.set(ctx.from.id, "gh_repos"); return ctx.reply("📂 GitHub Username দিন:"); });
 bot.action("gh_download", async (ctx) => { await ctx.answerCbQuery(); userModes.set(ctx.from.id, "gh_download"); return ctx.reply("⬇️ owner/repo ফরম্যাটে দিন:"); });
 bot.action("gh_search", async (ctx) => { await ctx.answerCbQuery(); userModes.set(ctx.from.id, "gh_search"); return ctx.reply("🔍 সার্চ কী-ওয়ার্ড দিন:"); });
-
-bot.action("html_encrypt", async (ctx) => {
-    await ctx.answerCbQuery();
-    const nj = await checkMembership(ctx, ctx.from.id);
-    if (nj.length) return ctx.reply("❌ চ্যানেলে জয়েন করুন!", getJoinKeyboard(nj));
-    userModes.set(ctx.from.id, "html_encrypt");
-    return ctx.reply("🔒 আপনার HTML ফাইল পাঠান:");
-});
-
-bot.action("find_username", async (ctx) => {
-    await ctx.answerCbQuery();
-    const nj = await checkMembership(ctx, ctx.from.id);
-    if (nj.length) return ctx.reply("❌ চ্যানেলে জয়েন করুন!", getJoinKeyboard(nj));
-    userModes.set(ctx.from.id, "find_username");
-    return ctx.reply("🔍 Channel/User ID দিন:");
-});
-
-bot.action("user_info", async (ctx) => {
-    await ctx.answerCbQuery();
-    const user = ctx.from;
-    const photos = await ctx.telegram.getUserProfilePhotos(user.id, 0, 1);
-    const text = `👤 <b>User Info</b>\n━━━━━━━━━━━━━━━━━━━━\n🆔 UID: <code>${user.id}</code>\n👤 Username: @${user.username || "N/A"}\n📛 Name: ${user.first_name} ${user.last_name || ""}\n🔗 Link: <a href="tg://user?id=${user.id}">Profile</a>\n━━━━━━━━━━━━━━━━━━━━`;
-    if (photos.total_count > 0) {
-        return ctx.replyWithPhoto(photos.photos[0][photos.photos[0].length - 1].file_id, { caption: text, parse_mode: "HTML" });
-    }
-    return ctx.reply(text, { parse_mode: "HTML" });
-});
-
-bot.action("bot_stats", async (ctx) => {
-    await ctx.answerCbQuery();
-    const { count } = countUsers.get();
-    return ctx.reply(`📊 <b>Bot Stats</b>\n\n👥 Total Users: <b>${count}</b>`, { parse_mode: "HTML" });
-});
-
-bot.action("bot_info", async (ctx) => {
-    await ctx.answerCbQuery();
-    return ctx.reply(`ℹ️ <b>Bot Features</b>\n━━━━━━━━━━━━━━━━━━━━\n🌐 Website Source Code\n🔓 HTML Decoding (PHPKobo, BJCoder, Base64+)\n🔥 Firebase Detect\n🐙 GitHub Tools\n🔒 HTML Encryption\n🔍 Find Username by ID\n👤 User Info\n📊 Bot Stats\n━━━━━━━━━━━━━━━━━━━━`, { parse_mode: "HTML" });
-});
-
-bot.action("contact_dev", async (ctx) => {
-    await ctx.answerCbQuery();
-    return ctx.reply(`📞 Developer: ${config.DEVELOPER_USERNAME}\n💬 https://t.me/${config.DEVELOPER_USERNAME.replace("@", "")}`);
-});
-
-bot.action("main_menu", async (ctx) => {
-    await ctx.answerCbQuery();
-    return ctx.reply("মেইন মেনু:", mainMenuKeyboard());
-});
+bot.action("main_menu", async (ctx) => { await ctx.answerCbQuery(); return ctx.reply("মেইন মেনু:", mainMenuReplyKeyboard()); });
 
 // ===== TEXT MESSAGE HANDLER =====
 bot.on("text", async (ctx) => {
@@ -410,16 +503,102 @@ bot.on("text", async (ctx) => {
     if (nj.length) return ctx.reply("❌ চ্যানেলে জয়েন করুন!", getJoinKeyboard(nj));
 
     const mode = userModes.get(ctx.from.id) || "";
-    const text = ctx.message.text;
+    const text = ctx.message.text.trim();
     const user = ctx.from;
 
+    // ===== REPLY KEYBOARD HANDLERS =====
+    if (text === "🌐 Source Code") {
+        userModes.set(ctx.from.id, "source_code");
+        return ctx.reply("🌐 ওয়েবসাইটের URL পাঠান (https:// সহ):");
+    }
+    if (text === "🔓 HTML Decode") {
+        userModes.set(ctx.from.id, "html_decode");
+        return ctx.reply("🔓 <b>HTML Decoding</b>\n\nসাপোর্টেড: PHPKobo, BJCoder, Base64, Hex, Unicode, URL, Octal, CharCode, ROT13, eval/Function\n\nHTML ফাইল বা URL পাঠান:", { parse_mode: "HTML" });
+    }
+    if (text === "🔥 Firebase") {
+        userModes.set(ctx.from.id, "firebase");
+        return ctx.reply("🔥 ওয়েবসাইটের URL পাঠান:");
+    }
+    if (text === "🐙 GitHub") {
+        return ctx.reply("🐙 <b>GitHub Tools</b>", {
+            parse_mode: "HTML",
+            ...Markup.inlineKeyboard([
+                [Markup.button.callback("👤 Info", "gh_info"), Markup.button.callback("📂 Repos", "gh_repos")],
+                [Markup.button.callback("⬇️ Download", "gh_download"), Markup.button.callback("🔍 Search", "gh_search")],
+                [Markup.button.callback("🔙 মেইন মেনু", "main_menu")],
+            ]),
+        });
+    }
+    if (text === "🔒 HTML Encrypt") {
+        userModes.set(ctx.from.id, "html_encrypt");
+        return ctx.reply("🔒 আপনার HTML ফাইল পাঠান:");
+    }
+    if (text === "🔍 Find User") {
+        userModes.set(ctx.from.id, "find_username");
+        return ctx.reply("🔍 Channel/User ID দিন:");
+    }
+    if (text === "👤 User Info") {
+        const photos = await ctx.telegram.getUserProfilePhotos(user.id, 0, 1);
+        const infoText = `👤 <b>User Info</b>\n━━━━━━━━━━━━━━━━━━━━\n🆔 UID: <code>${user.id}</code>\n👤 Username: @${user.username || "N/A"}\n📛 Name: ${user.first_name} ${user.last_name || ""}\n🔗 Link: <a href="tg://user?id=${user.id}">Profile</a>\n━━━━━━━━━━━━━━━━━━━━`;
+        if (photos.total_count > 0) {
+            return ctx.replyWithPhoto(photos.photos[0][photos.photos[0].length - 1].file_id, { caption: infoText, parse_mode: "HTML" });
+        }
+        return ctx.reply(infoText, { parse_mode: "HTML" });
+    }
+    if (text === "📊 Stats") {
+        const { count } = countUsers.get();
+        return ctx.reply(`📊 <b>Bot Stats</b>\n\n👥 Total Users: <b>${count}</b>`, { parse_mode: "HTML" });
+    }
+    if (text === "ℹ️ Bot Info") {
+        return ctx.reply(`ℹ️ <b>Bot Features</b>\n━━━━━━━━━━━━━━━━━━━━\n🌐 Website Source Code\n🔓 HTML Decoding (PHPKobo, BJCoder, Base64+)\n🔥 Firebase Detect\n🐙 GitHub Tools\n🔒 HTML Encryption\n🔍 Find Username by ID\n👤 User Info\n📊 Bot Stats\n━━━━━━━━━━━━━━━━━━━━`, { parse_mode: "HTML" });
+    }
+    if (text === "📞 Contact") {
+        return ctx.reply(`📞 Developer: ${config.DEVELOPER_USERNAME}\n💬 https://t.me/${config.DEVELOPER_USERNAME.replace("@", "")}`);
+    }
+
+    // ===== MODE HANDLERS =====
     if (mode === "source_code") {
+        if (!text.startsWith("http")) {
+            return ctx.reply("❌ সঠিক URL দিন (https:// সহ)");
+        }
         const loadMsg = await sendLoading(ctx, text);
         try {
-            const { data } = await axios.get(text, { headers: { "User-Agent": "Mozilla/5.0" }, timeout: 15000 });
+            const { data } = await axios.get(text, { 
+                headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" }, 
+                timeout: 15000,
+                maxRedirects: 5,
+            });
+            
+            // Get full page source including fetching linked scripts/css
+            let fullSource = data;
+            
+            // Extract and inline external JS
+            const scriptMatches = data.match(/<script[^>]+src=["'](https?:\/\/[^"']+)["'][^>]*>/gi) || [];
+            for (const tag of scriptMatches.slice(0, 10)) {
+                const srcMatch = tag.match(/src=["'](https?:\/\/[^"']+)["']/);
+                if (srcMatch) {
+                    try {
+                        const { data: jsContent } = await axios.get(srcMatch[1], { timeout: 10000 });
+                        fullSource += `\n\n<!-- ===== External Script: ${srcMatch[1]} ===== -->\n<script>\n${jsContent}\n</script>`;
+                    } catch {}
+                }
+            }
+            
+            // Extract and inline external CSS
+            const cssMatches = data.match(/<link[^>]+href=["'](https?:\/\/[^"']+\.css[^"']*)["'][^>]*>/gi) || [];
+            for (const tag of cssMatches.slice(0, 10)) {
+                const hrefMatch = tag.match(/href=["'](https?:\/\/[^"']+)["']/);
+                if (hrefMatch) {
+                    try {
+                        const { data: cssContent } = await axios.get(hrefMatch[1], { timeout: 10000 });
+                        fullSource += `\n\n<!-- ===== External CSS: ${hrefMatch[1]} ===== -->\n<style>\n${cssContent}\n</style>`;
+                    } catch {}
+                }
+            }
+            
             const tmpFile = `/tmp/source_${Date.now()}.html`;
-            fs.writeFileSync(tmpFile, data);
-            const size = `${(Buffer.byteLength(data) / 1024).toFixed(1)} KB`;
+            fs.writeFileSync(tmpFile, fullSource);
+            const size = `${(Buffer.byteLength(fullSource) / 1024).toFixed(1)} KB`;
             await sendResultCard(ctx, text, size);
             await ctx.replyWithDocument({ source: tmpFile, filename: "source_code.html" });
             fs.unlinkSync(tmpFile);
@@ -429,6 +608,9 @@ bot.on("text", async (ctx) => {
         }
         userModes.delete(ctx.from.id);
     } else if (mode === "firebase") {
+        if (!text.startsWith("http")) {
+            return ctx.reply("❌ সঠিক URL দিন (https:// সহ)");
+        }
         const loadMsg = await sendLoading(ctx, text);
         const result = await detectFirebase(text);
         if (result.found) {
@@ -437,12 +619,13 @@ bot.on("text", async (ctx) => {
             if (result.services.length) { configText += "\n<b>Services:</b>\n"; result.services.forEach(s => configText += `  ${s}\n`); }
             await ctx.telegram.editMessageText(ctx.chat.id, loadMsg.message_id, null, configText, { parse_mode: "HTML" });
         } else {
-            await ctx.telegram.editMessageText(ctx.chat.id, loadMsg.message_id, null, "❌ Firebase পাওয়া যায়নি।");
+            const errMsg = result.error ? `\n\nError: ${result.error}` : "";
+            await ctx.telegram.editMessageText(ctx.chat.id, loadMsg.message_id, null, `❌ Firebase পাওয়া যায়নি।${errMsg}`);
         }
         try { await ctx.telegram.sendMessage(config.HISTORY_CHANNEL_ID, `🔥 Firebase\n👤 @${user.username} (${user.id})\n🔗 ${text}`); } catch {}
         userModes.delete(ctx.from.id);
     } else if (mode === "gh_info") {
-        const info = await getGithubUser(text.trim());
+        const info = await getGithubUser(text);
         if (info) {
             const t = `🐙 <b>GitHub User</b>\n━━━━━━━━━━━━━━━━━━━━\n👤 ${info.name || "N/A"}\n🆔 ${info.login}\n📝 ${info.bio || "N/A"}\n📂 Repos: ${info.public_repos}\n👥 Followers: ${info.followers}\n🔗 ${info.html_url}\n━━━━━━━━━━━━━━━━━━━━`;
             if (info.avatar_url) await ctx.replyWithPhoto(info.avatar_url, { caption: t, parse_mode: "HTML" });
@@ -450,23 +633,32 @@ bot.on("text", async (ctx) => {
         } else await ctx.reply("❌ GitHub ইউজার পাওয়া যায়নি।");
         userModes.delete(ctx.from.id);
     } else if (mode === "gh_repos") {
-        const repos = await getUserRepos(text.trim());
+        const repos = await getUserRepos(text);
         if (repos.length) {
-            let t = `📂 <b>${text.trim()}'s Repos</b>\n\n`;
+            let t = `📂 <b>${text}'s Repos</b>\n\n`;
             repos.forEach((r, i) => { t += `${i+1}. <b>${r.name}</b> ⭐${r.stargazers_count} 🍴${r.forks_count} 📝${r.language || "N/A"}\n🔗 ${r.html_url}\n\n`; });
             await ctx.reply(t, { parse_mode: "HTML", disable_web_page_preview: true });
         } else await ctx.reply("❌ রিপো পাওয়া যায়নি।");
         userModes.delete(ctx.from.id);
     } else if (mode === "gh_download") {
-        const parts = text.trim().split("/");
+        const parts = text.split("/");
         if (parts.length >= 2) {
             const [owner, repo] = [parts[parts.length-2], parts[parts.length-1]];
-            await ctx.reply(`⬇️ Download: https://github.com/${owner}/${repo}/archive/refs/heads/main.zip`);
+            const url = `https://github.com/${owner}/${repo}/archive/refs/heads/main.zip`;
+            // Verify the repo exists
+            try {
+                await axios.head(url, { timeout: 10000, maxRedirects: 5 });
+                await ctx.reply(`⬇️ Download Link:\n${url}`);
+            } catch {
+                // Try master branch
+                const masterUrl = `https://github.com/${owner}/${repo}/archive/refs/heads/master.zip`;
+                await ctx.reply(`⬇️ Download Link (try both):\n\nmain: ${url}\nmaster: ${masterUrl}`);
+            }
         } else await ctx.reply("❌ ফরম্যাট: owner/repo");
         userModes.delete(ctx.from.id);
     } else if (mode === "gh_search") {
         try {
-            const { data } = await axios.get(`https://api.github.com/search/repositories?q=${encodeURIComponent(text)}&per_page=5`);
+            const { data } = await axios.get(`https://api.github.com/search/repositories?q=${encodeURIComponent(text)}&per_page=5`, { timeout: 10000 });
             if (data.items.length) {
                 let t = `🔍 <b>Results for: ${text}</b>\n\n`;
                 data.items.forEach((r, i) => { t += `${i+1}. <b>${r.full_name}</b> ⭐${r.stargazers_count}\n${(r.description || "").slice(0, 80)}\n🔗 ${r.html_url}\n\n`; });
@@ -476,20 +668,24 @@ bot.on("text", async (ctx) => {
         userModes.delete(ctx.from.id);
     } else if (mode === "find_username") {
         try {
-            const chatId = parseInt(text.trim());
+            const chatId = parseInt(text);
             const chat = await ctx.telegram.getChat(chatId);
             await ctx.reply(`🔍 <b>Found!</b>\n━━━━━━━━━━━━━━━━━━━━\n🆔 ID: <code>${chat.id}</code>\n📛 ${chat.title || chat.first_name || "N/A"}\n👤 @${chat.username || "N/A"}\n🔗 ${chat.username ? `https://t.me/${chat.username}` : "N/A"}\n━━━━━━━━━━━━━━━━━━━━`, { parse_mode: "HTML" });
         } catch (e) {
             await ctx.reply(`❌ পাওয়া যায়নি: ${e.message}`);
         }
         userModes.delete(ctx.from.id);
-    } else if (mode === "html_decode" && text.startsWith("http")) {
+    } else if (mode === "html_decode") {
+        if (!text.startsWith("http")) {
+            return ctx.reply("❌ সঠিক URL দিন বা HTML ফাইল পাঠান");
+        }
         const loadMsg = await sendLoading(ctx, text);
         try {
-            const { data } = await axios.get(text, { timeout: 15000 });
-            const { results, decoded } = multiLayerDecode(data);
+            const { data } = await axios.get(text, { timeout: 15000, maxRedirects: 5 });
+            const { results, decoded, wasDecoded } = multiLayerDecode(data);
             let t = "🔓 <b>Decoding Results</b>\n\n";
             results.forEach(r => t += r + "\n");
+            if (!wasDecoded) t += "\n⚠️ ম্যানুয়াল ডিকোডিং প্রয়োজন হতে পারে";
             await ctx.telegram.editMessageText(ctx.chat.id, loadMsg.message_id, null, t, { parse_mode: "HTML" });
             const tmpFile = `/tmp/decoded_${Date.now()}.html`;
             fs.writeFileSync(tmpFile, decoded);
@@ -534,9 +730,11 @@ bot.on("document", async (ctx) => {
         await ctx.replyWithDocument({ source: tmpFile, filename: `encrypted_${filename}` }, { caption: "🔒 Encrypted - ডিকোডিং অসম্ভব!" });
         fs.unlinkSync(tmpFile);
     } else {
-        const { results, decoded } = multiLayerDecode(data);
+        // Auto decode mode
+        const { results, decoded, wasDecoded } = multiLayerDecode(data);
         let t = "🔓 <b>Decoding Results</b>\n\n";
         results.forEach(r => t += r + "\n");
+        if (!wasDecoded) t += "\n⚠️ সম্পূর্ণ ডিকোড করা সম্ভব হয়নি";
         await ctx.telegram.editMessageText(ctx.chat.id, loadMsg.message_id, null, t, { parse_mode: "HTML" });
         const tmpFile = `/tmp/dec_${Date.now()}.html`;
         fs.writeFileSync(tmpFile, decoded);
