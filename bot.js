@@ -751,3 +751,15 @@ bot.on("document", async (ctx) => {
 bot.launch().then(() => console.log("🤖 Bot started!"));
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
+const express = require('express');
+const app = express();
+const port = process.env.PORT || 3000;
+
+app.get('/', (req, res) => {
+  res.send('Bot is Running! 🚀');
+});
+
+app.listen(port, () => {
+  console.log(`Server is listening on port ${port}`);
+});
+
